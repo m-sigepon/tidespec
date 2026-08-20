@@ -1,0 +1,8 @@
+# Experimental: NGRAM x DFlash2 fusion (dictionary-first drafting inside the
+# DFLASH worker, opt-in via SGLANG_DFLASH_NGRAM_FUSION=1). Based on the
+# abort-fixed PR-35496 image.
+ARG BASE=sglang:dflash2-fixed
+FROM ${BASE}
+COPY patches/dflash_worker_v2.py /sgl-workspace/sglang/python/sglang/srt/speculative/dflash_worker_v2.py
+RUN python -c "import ast; ast.parse(open('/sgl-workspace/sglang/python/sglang/srt/speculative/dflash_worker_v2.py').read()); print('syntax OK')" \
+    && python -c "from sglang.srt.speculative import dflash_worker_v2; print('import OK')"

@@ -1,0 +1,7 @@
+# Local fix on top of the PR-35496 DFlash2 image: always dispatch AbortReq to
+# the scheduler even if rid_to_state was already cleaned up on disconnect
+# (otherwise a stopped stream keeps generating until the context limit).
+ARG BASE=sglang:dflash2
+FROM ${BASE}
+COPY patches/tokenizer_manager.py /sgl-workspace/sglang/python/sglang/srt/managers/tokenizer_manager.py
+RUN python -c "import ast; ast.parse(open('/sgl-workspace/sglang/python/sglang/srt/managers/tokenizer_manager.py').read()); print('syntax OK')"

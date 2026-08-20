@@ -1,0 +1,13 @@
+# DFlash2 (incoai/Qwen3.8-27B-DFlash2) support on top of the Qwen3.8-27B image.
+# The qwen38-27b image (built 2026-08-14) lacks the DFlash2DraftModel class;
+# upstream main has it, so update only the sglang python tree.
+FROM lmsysorg/sglang:qwen38-27b
+
+ARG SGLANG_REF=main
+# The image ships the sglang source tree without .git, so init one in place
+# and overwrite the tree with upstream ${SGLANG_REF}.
+RUN cd /sgl-workspace/sglang \
+    && git init -q \
+    && git fetch --depth 1 https://github.com/sgl-project/sglang.git ${SGLANG_REF} \
+    && git checkout -f FETCH_HEAD \
+    && python -c "from sglang.srt.models.dflash import DFlash2DraftModel; print('DFlash2DraftModel OK')"

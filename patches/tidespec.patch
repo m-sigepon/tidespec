@@ -1,0 +1,457 @@
+--- patches/dflash_worker_v2.pristine.py	2026-08-21 05:23:04.742984800 +0900
++++ patches/dflash_worker_v2.py	2026-08-21 05:22:52.259313700 +0900
+@@ -1,5 +1,6 @@
+ import logging
+ import math
++import os
+ from dataclasses import replace
+ from typing import List, Optional, Tuple
+ 
+@@ -176,6 +177,18 @@
+     return sampling_info is None or sampling_info.is_all_greedy
+ 
+ 
++# NGRAM x DFLASH fusion v4 (opt-in via SGLANG_DFLASH_NGRAM_FUSION=1).
++# Dictionary arm = sglang's C++ ngram trie (all occurrences, stateful match);
++# fires only when its shadow-scored expectation beats the draft model's own
++# accept EMA. Verification is unchanged.
++_NGRAM_FUSION_ENABLED = os.environ.get("SGLANG_DFLASH_NGRAM_FUSION", "0") == "1"
++_NGRAM_FUSION_EMA = float(os.environ.get("SGLANG_DFLASH_NGRAM_EMA", "0.8"))
++_NGRAM_FUSION_MARGIN = float(os.environ.get("SGLANG_DFLASH_NGRAM_MARGIN", "0"))
++_NGRAM_FUSION_MIN_PROPOSE = int(os.environ.get("SGLANG_DFLASH_NGRAM_MIN_PROPOSE", "4"))
++_NGRAM_FUSION_TRIE_DEPTH = int(os.environ.get("SGLANG_DFLASH_NGRAM_TRIE_DEPTH", "18"))
++_NGRAM_FUSION_MIN_W = float(os.environ.get("SGLANG_DFLASH_NGRAM_MIN_W", "2.5"))
++
++
+ def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
+     # Flattened to [N, H] and viewed back because the radix top-k kernel is 2D.
+     bs, num_pred = pred_hidden.shape[0], pred_hidden.shape[1]
+@@ -368,6 +381,19 @@
+         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
+         self._selector_sample: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
++        self._fusion_live_rid = None
++        self._fusion_live = None  # {"toks": committed history}
++        self._fusion_corpus = None
++        self._fusion_weight = 0.0
++        self._fusion_model_ema = 4.0
++        self._fusion_shadow = None  # {"cont": proposal, "chosen": str}
++        self._fusion_hits = 0
++        self._fusion_steps = 0
++        self._fusion_ring = None
++        self._fusion_ring_next = 0
++        self._fusion_fail_run = 0
++        self._fusion_fired = 0
++        self._fusion_streak = 0
+         self._draft_block_spec_info = make_draft_block_spec_info(
+             draft_token_num=int(self.block_size), device=self.device
+         )
+@@ -936,6 +962,141 @@
+ 
+         return int(resolved_id)
+ 
++    # --- NGRAM x DFLASH fusion v4 ------------------------------------------
++    def _fusion_get_corpus(self):
++        if self._fusion_corpus is None:
++            from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
++
++            self._fusion_corpus = NgramCorpus(
++                max_trie_depth=_NGRAM_FUSION_TRIE_DEPTH,
++                min_bfs_breadth=1,
++                max_bfs_breadth=1,
++                draft_token_num=int(self.block_size),
++                match_type="BFS",
++                capacity=10_000_000,
++            )
++        return self._fusion_corpus
++
++    def _fusion_drain_and_score(self):
++        if not self._fusion_ring:
++            return
++        e = _NGRAM_FUSION_EMA
++        for slot in self._fusion_ring:
++            if slot["st"] is None or not slot["evt"].query():
++                continue
++            try:
++                cl = int(slot["clen"][0])
++                committed = slot["buf"][:cl].tolist()
++                slot["st"]["toks"].extend(committed)
++                shadow = slot["shadow"]
++                if shadow is not None:
++                    cont = shadow["cont"]
++                    # Score the trie arm only on steps where it actually
++                    # proposed: the weight is then the conditional expected
++                    # accept length given a proposal, which is the fair
++                    # quantity to compare against the model's accept EMA.
++                    if cont is not None:
++                        n = 0
++                        for a_tok, b_tok in zip(cont, committed):
++                            if a_tok != b_tok:
++                                break
++                            n += 1
++                        self._fusion_weight = e * self._fusion_weight + (1 - e) * float(n)
++                    if shadow["chosen"] == "model":
++                        self._fusion_model_ema = e * self._fusion_model_ema + (
++                            1 - e
++                        ) * float(max(cl - 1, 0))
++                    elif shadow["chosen"] == "trie" and cont is not None:
++                        # AIMD with spurious-loss tolerance: one failed fire
++                        # halves the streak (small wave inside a flood);
++                        # two consecutive failures reset it (real ebb).
++                        if n >= 6:
++                            self._fusion_streak = min(self._fusion_streak + 1, 6)
++                            self._fusion_fail_run = 0
++                        else:
++                            self._fusion_fail_run += 1
++                            if self._fusion_fail_run >= 2:
++                                self._fusion_streak = 0
++                            else:
++                                self._fusion_streak //= 2
++            except Exception as e2:
++                logger.warning("DFLASH ngram-fusion drain failed: %s", e2)
++            slot["st"] = None
++            slot["shadow"] = None
++
++    def _fusion_state_for(self, req):
++        rid = getattr(req, "rid", None)
++        if rid is None:
++            return None
++        if rid == self._fusion_live_rid:
++            return self._fusion_live
++        toks = list(getattr(req, "origin_input_ids", None) or [])
++        toks += list(getattr(req, "output_ids", None) or [])
++        self._fusion_live_rid = rid
++        self._fusion_live = {"toks": toks, "rid": str(rid)}
++        return self._fusion_live
++
++    def _fusion_lookup(self, st, need):
++        corpus = self._fusion_get_corpus()
++        toks = st["toks"]
++        window = toks[-_NGRAM_FUSION_TRIE_DEPTH:]
++        # Feed the trie, then match. Both are cheap C++ calls.
++        corpus.batch_put([window])
++        corpus.synchronize()
++        drafts, mask = corpus.batch_get([st["rid"]], [window], [len(toks)])
++        blk = int(self.block_size)
++        row = [int(x) for x in drafts[:blk]]
++        import numpy as _np
++
++        m = _np.asarray(mask).reshape(-1)
++        if m.size >= blk * blk:
++            tree = m[: blk * blk].reshape(blk, blk).tolist()
++            paths = corpus.leaf_paths_from_mask(row, tree)
++        else:
++            paths = []
++        if not paths:
++            # Chain fallback: with breadth=1 the row itself is the path.
++            paths = [row]
++        path = max(paths, key=len)
++        # Root convention: drop the anchor if the path starts with it.
++        cont = path[1:] if path and path[0] == toks[-1] else list(path)
++        cont = [t for t in cont if t >= 0][:need]
++        if len(cont) < _NGRAM_FUSION_MIN_PROPOSE:
++            return None, False
++        full = len(cont) == need
++        if len(cont) < need:
++            cont = cont + [int(self._mask_token_id)] * (need - len(cont))
++        self._fusion_hits += 1
++        return cont, full
++
++    def _fusion_commit_async(self, st, out_tokens, commit_lens):
++        if self._fusion_ring is None:
++            self._fusion_ring = [
++                {
++                    "buf": torch.empty(
++                        (out_tokens.shape[1],), dtype=out_tokens.dtype, pin_memory=True
++                    ),
++                    "clen": torch.empty(
++                        (1,), dtype=commit_lens.dtype, pin_memory=True
++                    ),
++                    "evt": torch.cuda.Event(),
++                    "st": None,
++                    "shadow": None,
++                }
++                for _ in range(4)
++            ]
++        slot = self._fusion_ring[self._fusion_ring_next]
++        self._fusion_ring_next = (self._fusion_ring_next + 1) % len(self._fusion_ring)
++        if slot["st"] is not None:
++            slot["st"] = None
++            slot["shadow"] = None
++        slot["buf"].copy_(out_tokens[0], non_blocking=True)
++        slot["clen"].copy_(commit_lens[:1], non_blocking=True)
++        slot["evt"].record()
++        slot["st"] = st
++        slot["shadow"] = self._fusion_shadow
++        self._fusion_shadow = None
++
+     def _propose_selector_block(
+         self,
+         *,
+@@ -1829,109 +1990,158 @@
+             )
+             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
+ 
+-        noise_embedding = embed_module(block_ids)
+-        if self._noise_embed_scale != 1.0:
+-            noise_embedding = noise_embedding * self._noise_embed_scale
+-        input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
+-
+         positions = positions_2d.reshape(-1)
+         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
+ 
+-        seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
+-        if self.use_compact_draft_cache:
+-            # Rebuild the draft-local sliding-window view from committed target state.
+-            draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
+-            self._fill_compact_seq_lens_cpu_bound(
+-                batch_seq_lens_cpu=batch.seq_lens_cpu,
+-                nxt_kv_lens_cpu=draft_input.nxt_kv_lens_cpu,
+-                draft_prefix_lens=draft_prefix_lens,
+-                out=seq_lens_cpu,
+-            )
+-            self._rebuild_compact_draft_cache(
+-                req_pool_indices=batch.req_pool_indices,
+-                prefix_lens=prefix_lens,
+-                draft_prefix_lens=draft_prefix_lens,
+-                verify_out_cache_loc_2d=verify_out_cache_loc_2d,
+-                bs=bs,
+-                block_size=block_size,
+-            )
+-            draft_seq_lens = draft_prefix_lens
+-            draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
+-        else:
+-            # Non-windowed path uses the shared overallocated mapping directly.
+-            # Backend planning only needs a safe upper bound for the committed
+-            # prefix lengths, not the full allocator reservation length.
+-            draft_seq_lens = prefix_lens
+-            if batch.seq_lens_cpu is not None:
+-                # Host bound = committed prefix + one verify block.
+-                seq_lens_cpu.copy_(batch.seq_lens_cpu)
+-                seq_lens_cpu.add_(block_size)
+-                draft_seq_lens_sum = int(seq_lens_cpu.sum())
+-            elif draft_input.nxt_kv_lens_cpu is not None:
+-                # GPU-only backend: reserved is a safe over-estimate.
+-                seq_lens_cpu.copy_(draft_input.nxt_kv_lens_cpu)
+-                draft_seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
+-            else:
+-                seq_lens_cpu.copy_(prefix_lens.to("cpu", dtype=torch.int32))
+-                draft_seq_lens_sum = int(prefix_lens.sum().item())
+-
+-        forward_batch = ForwardBatch(
+-            forward_mode=ForwardMode.TARGET_VERIFY,
+-            batch_size=bs,
+-            input_ids=block_ids.flatten(),
+-            req_pool_indices=batch.req_pool_indices,
+-            seq_lens=draft_seq_lens,
+-            out_cache_loc=verify_out_cache_loc,
+-            seq_lens_sum=draft_seq_lens_sum,
+-            seq_lens_cpu=seq_lens_cpu,
+-            positions=positions,
+-            input_embeds=input_embeds,
+-            spec_algorithm=SpeculativeAlgorithm.DFLASH,
+-            spec_info=self._draft_block_spec_info,
+-            capture_hidden_mode=CaptureHiddenMode.NULL,
+-        )
++        fusion_st = None
++        fusion_cont = None
++        if (
++            _NGRAM_FUSION_ENABLED
++            and bs == 1
++            and not self.use_compact_draft_cache
++            and _is_all_greedy(batch.sampling_info)
++            and getattr(batch, "reqs", None)
++        ):
++            try:
++                self._fusion_drain_and_score()
++                fusion_st = self._fusion_state_for(batch.reqs[0])
++                if fusion_st is not None:
++                    cont, full = self._fusion_lookup(fusion_st, block_size - 1)
++                    chosen = "model"
++                    # Regime-gated firing: a full-length continuation is the
++                    # instantaneous copy signal, and the conditional-accept EMA
++                    # must not have collapsed (novel-text false copies drive it
++                    # toward 0, halting firing automatically).
++                    bar = _NGRAM_FUSION_MIN_W * (0.5 ** self._fusion_streak)
++                    if cont is not None and full and self._fusion_weight >= bar:
++                        fusion_cont = cont
++                        chosen = "trie"
++                        self._fusion_fired += 1
++                    self._fusion_shadow = {"cont": cont, "chosen": chosen}
++                self._fusion_steps += 1
++                if self._fusion_steps % 500 == 0:
++                    logger.info(
++                        "DFLASH ngram-fusion v4: %d proposals / %d fired / %d steps, "
++                        "trie_w=%.2f model_ema=%.2f streak=%d",
++                        self._fusion_hits,
++                        self._fusion_fired,
++                        self._fusion_steps,
++                        self._fusion_weight,
++                        self._fusion_model_ema,
++                        self._fusion_streak,
++                    )
++            except Exception as e:
++                logger.warning("DFLASH ngram-fusion v4 lookup failed: %s", e)
++                fusion_st = None
++                fusion_cont = None
+ 
+-        if self.selector is not None:
++        if fusion_cont is not None:
+             self._selector_sample = None
+-            if self._draft_sampler is not None:
+-                # Consumed by the in-graph sample; must be staged before the replay.
+-                self._draft_sampler.stage_sampling_params(
+-                    bs=bs, sampling_info=batch.sampling_info
++            draft_next = torch.tensor(
++                fusion_cont, dtype=torch.int64, device=device
++            ).view(1, -1)
++        else:
++            noise_embedding = embed_module(block_ids)
++            if self._noise_embed_scale != 1.0:
++                noise_embedding = noise_embedding * self._noise_embed_scale
++            input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
++
++
++            seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
++            if self.use_compact_draft_cache:
++                # Rebuild the draft-local sliding-window view from committed target state.
++                draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
++                self._fill_compact_seq_lens_cpu_bound(
++                    batch_seq_lens_cpu=batch.seq_lens_cpu,
++                    nxt_kv_lens_cpu=draft_input.nxt_kv_lens_cpu,
++                    draft_prefix_lens=draft_prefix_lens,
++                    out=seq_lens_cpu,
+                 )
++                self._rebuild_compact_draft_cache(
++                    req_pool_indices=batch.req_pool_indices,
++                    prefix_lens=prefix_lens,
++                    draft_prefix_lens=draft_prefix_lens,
++                    verify_out_cache_loc_2d=verify_out_cache_loc_2d,
++                    bs=bs,
++                    block_size=block_size,
++                )
++                draft_seq_lens = draft_prefix_lens
++                draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
++            else:
++                # Non-windowed path uses the shared overallocated mapping directly.
++                # Backend planning only needs a safe upper bound for the committed
++                # prefix lengths, not the full allocator reservation length.
++                draft_seq_lens = prefix_lens
++                if batch.seq_lens_cpu is not None:
++                    # Host bound = committed prefix + one verify block.
++                    seq_lens_cpu.copy_(batch.seq_lens_cpu)
++                    seq_lens_cpu.add_(block_size)
++                    draft_seq_lens_sum = int(seq_lens_cpu.sum())
++                elif draft_input.nxt_kv_lens_cpu is not None:
++                    # GPU-only backend: reserved is a safe over-estimate.
++                    seq_lens_cpu.copy_(draft_input.nxt_kv_lens_cpu)
++                    draft_seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
++                else:
++                    seq_lens_cpu.copy_(prefix_lens.to("cpu", dtype=torch.int32))
++                    draft_seq_lens_sum = int(prefix_lens.sum().item())
+ 
+-        with torch.inference_mode():
+-            draft_out = self.draft_model_runner.forward(forward_batch)
+-        draft_logits_output = draft_out.logits_output
+-
+-        folded = self._draft_sampler is not None and draft_out.can_run_graph
+-        if folded:
+-            draft_next = self._draft_sampler.out[
+-                : bs * (int(self.block_size) - 1)
+-            ].view(bs, int(self.block_size) - 1)
+-            if self.selector is not None and not _is_all_greedy(batch.sampling_info):
+-                self._selector_sample = (
+-                    self._draft_sampler.candidate_out[:bs],
+-                    self._draft_sampler.q_out[:bs],
+-                )
+-        elif self.selector is not None:
+-            draft_next = self._propose_selector_block(
+-                draft_logits_output=draft_logits_output,
+-                bs=bs,
+-                lm_head=lm_head,
+-                anchor_token_ids=block_ids[:, 0],
+-                sampling_info=batch.sampling_info,
++            forward_batch = ForwardBatch(
++                forward_mode=ForwardMode.TARGET_VERIFY,
++                batch_size=bs,
++                input_ids=block_ids.flatten(),
++                req_pool_indices=batch.req_pool_indices,
++                seq_lens=draft_seq_lens,
++                out_cache_loc=verify_out_cache_loc,
++                seq_lens_sum=draft_seq_lens_sum,
++                seq_lens_cpu=seq_lens_cpu,
++                positions=positions,
++                input_embeds=input_embeds,
++                spec_algorithm=SpeculativeAlgorithm.DFLASH,
++                spec_info=self._draft_block_spec_info,
++                capture_hidden_mode=CaptureHiddenMode.NULL,
+             )
+-        else:
+-            draft_hidden = draft_logits_output.hidden_states
+-            if draft_hidden is None:
+-                raise RuntimeError("DFLASH draft model returned no hidden states.")
+-            draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+-            draft_next = self._greedy_sample_from_vocab_parallel_head(
+-                hidden_states=draft_hidden[:, 1:, :].reshape(
+-                    -1, draft_hidden.shape[-1]
+-                ),
+-                lm_head=lm_head,
+-            ).view(bs, int(self.block_size) - 1)
++
++            if self.selector is not None:
++                self._selector_sample = None
++                if self._draft_sampler is not None:
++                    # Consumed by the in-graph sample; must be staged before the replay.
++                    self._draft_sampler.stage_sampling_params(
++                        bs=bs, sampling_info=batch.sampling_info
++                    )
++
++            with torch.inference_mode():
++                draft_out = self.draft_model_runner.forward(forward_batch)
++            draft_logits_output = draft_out.logits_output
++
++            folded = self._draft_sampler is not None and draft_out.can_run_graph
++            if folded:
++                draft_next = self._draft_sampler.out[
++                    : bs * (int(self.block_size) - 1)
++                ].view(bs, int(self.block_size) - 1)
++                if self.selector is not None and not _is_all_greedy(batch.sampling_info):
++                    self._selector_sample = (
++                        self._draft_sampler.candidate_out[:bs],
++                        self._draft_sampler.q_out[:bs],
++                    )
++            elif self.selector is not None:
++                draft_next = self._propose_selector_block(
++                    draft_logits_output=draft_logits_output,
++                    bs=bs,
++                    lm_head=lm_head,
++                    anchor_token_ids=block_ids[:, 0],
++                    sampling_info=batch.sampling_info,
++                )
++            else:
++                draft_hidden = draft_logits_output.hidden_states
++                if draft_hidden is None:
++                    raise RuntimeError("DFLASH draft model returned no hidden states.")
++                draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
++                draft_next = self._greedy_sample_from_vocab_parallel_head(
++                    hidden_states=draft_hidden[:, 1:, :].reshape(
++                        -1, draft_hidden.shape[-1]
++                    ),
++                    lm_head=lm_head,
++                ).view(bs, int(self.block_size) - 1)
+ 
+         draft_tokens = self._draft_block_tokens_buf[:bs]
+         draft_tokens[:, 0].copy_(block_ids[:, 0])
+@@ -2076,6 +2286,12 @@
+                 )
+                 out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+ 
++        if fusion_st is not None:
++            try:
++                self._fusion_commit_async(fusion_st, out_tokens, commit_lens)
++            except Exception as e:
++                logger.warning("DFLASH ngram-fusion commit failed: %s", e)
++
+         if SIMULATE_ACC_LEN > 0:
+             if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
+                 raise ValueError(
