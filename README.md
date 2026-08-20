@@ -2,9 +2,9 @@
 
 [日本語版](#日本語版) | [English](#english)
 
-<!-- demo video: after push, drag & drop demo.mp4 into the README web editor here and keep the generated user-attachments URL -->
-
 Regime-adaptive dictionary drafting layered on SGLang's DFlash2 speculative decoding. Experimental patch, tuned for a single RTX 5090.
+
+https://github.com/user-attachments/assets/45bc54ff-ab08-4a5d-816c-0c8bb2ed23f1
 
 ---
 
